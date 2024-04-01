@@ -10,6 +10,9 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from einops import rearrange
 
+from ring_flash_attn import zigzag_ring_flash_attn_varlen_kvpacked_func as ring_flash_attn_unpadded_func
+from internlm.model.ring_attention import RingFlashCrossAttention, RingFlashSelfAttention
+
 try:
     from flash_attn.flash_attn_interface import flash_attn_unpadded_func
 except ImportError:
@@ -39,6 +42,8 @@ from internlm.core.context import global_context as gpc
 from internlm.model.embedding import DynamicNTKScalingRotaryEmbedding, RotaryEmbedding
 from internlm.model.linear import get_linear_cls
 
+from internlm.utils.logger import get_logger
+logger = get_logger(__file__)
 
 # adpated from https://github.com/microsoft/DeepSpeed/blob/master/deepspeed/sequence/layer.py
 class _SeqAllToAll(torch.autograd.Function):
@@ -213,6 +218,7 @@ class MHA(nn.Module):
         assert self.embed_dim % num_heads == 0, "self.kdim must be divisible by num_heads"
         self.head_dim = self.embed_dim // num_heads
         self.tp_mode = tp_mode
+        self.spg = sequence_process_group
 
         if self.rotary_emb_dim > 0:
             if self.use_dynamic_ntk_rope:
@@ -240,13 +246,21 @@ class MHA(nn.Module):
             **factory_kwargs,
         )  # according to https://spaces.ac.cn/archives/9577
 
-        inner_attn_cls = FlashSelfAttention if use_flash_attn else SelfAttention
-        inner_cross_attn_cls = FlashCrossAttention if use_flash_attn else CrossAttention
+        self.use_ring_attn = gpc.config.use_ring_attn
+        if use_flash_attn:
+            if self.use_ring_attn:
+                inner_attn_cls = RingFlashSelfAttention
+                inner_cross_attn_cls = RingFlashCrossAttention
+            else:
+                inner_attn_cls = FlashSelfAttention
+                inner_cross_attn_cls = FlashCrossAttention
+        else:
+            inner_attn_cls = SelfAttention
+            inner_cross_attn_cls = CrossAttention
         self.inner_attn = inner_attn_cls(causal=causal, softmax_scale=softmax_scale, attention_dropout=dropout)
         self.inner_cross_attn = inner_cross_attn_cls(
-            causal=causal, softmax_scale=softmax_scale, attention_dropout=dropout
-        )
-        if self.tp_mode == "isp":
+            causal=causal, softmax_scale=softmax_scale, attention_dropout=dropout)
+        if self.tp_mode == "isp" and not self.use_ring_attn:
             self.inner_attn = DistributedAttention(self.inner_attn, sequence_process_group=sequence_process_group)
             self.inner_cross_attn = DistributedAttention(
                 self.inner_cross_attn, sequence_process_group=sequence_process_group
@@ -419,8 +433,12 @@ class MHA(nn.Module):
                             if total_kv.dtype not in [torch.float16, torch.bfloat16]:
                                 total_kv = total_kv.to(torch.bfloat16)
 
-                    output = flash_attn_unpadded_func(
-                        total_q, total_kv, cu_seqlens, cu_seqlens, max_seqlen_q, max_seqlen_k, 0.0, None, True, False
+                    if self.use_ring_attn:
+                        unpadded_func = ring_flash_attn_unpadded_func
+                    else:
+                        unpadded_func = flash_attn_unpadded_func
+                    output = unpadded_func(
+                        total_q, total_kv, cu_seqlens, cu_seqlens, max_seqlen_q, max_seqlen_k, 0.0, None, True, False, self.spg
                     ).to(x.dtype)
 
                     context = torch.zeros_like(q)
@@ -468,6 +486,10 @@ class MHA(nn.Module):
         qkv = rearrange(qkv, "t (three h d) -> t three h d", three=3, d=self.head_dim)  # total x 3 x n_head x d
         qkv = self.rotary_emb(qkv, **kwargs)
         kwargs.pop("indexes")
+        # if gpc.is_rank_for_log():
+        #     logger.info(f"before attn: cuda memory profiling: max_allocated {torch.cuda.max_memory_allocated()}, allocated {torch.cuda.memory_allocated()}")
+        # if torch.cuda.max_memory_allocated() > 54143400000:
+        #     import pdb;pdb.set_trace()
         if inference_params is None:
             if gpc.config.model.dtype is torch.float32 and gpc.config.model.use_flash_attn:
                 with torch.cuda.amp.autocast(dtype=torch.bfloat16):
@@ -479,6 +501,8 @@ class MHA(nn.Module):
 
         else:
             raise RuntimeError("Not support this right now")
+        # if gpc.is_rank_for_log():
+        #     logger.info(f"after attn: cuda memory profiling: max_allocated {torch.cuda.max_memory_allocated()}, allocated {torch.cuda.memory_allocated()}")
 
         context = rearrange(context, "b h d -> b (h d)")  # recover the shape
         out = self.out_proj(context)

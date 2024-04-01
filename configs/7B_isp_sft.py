@@ -1,12 +1,17 @@
-JOB_NAME = "7b_train"
+JOB_NAME = "7b_train_ring"
 DO_ALERT = False
 
-SEQ_LEN = 2048
+SEQ_LEN = 1024 * 256
 HIDDEN_SIZE = 4096
 NUM_ATTENTION_HEAD = 32
 MLP_RATIO = 8 / 3
 NUM_LAYER = 32
 VOCAB_SIZE = 103168
+
+# mlp_chunk_size = 128  # mlp
+# qkv_chunk_size = 128  # attention
+use_ring_attn = True
+# blockwise_ffn = True
 
 MODEL_ONLY_FOLDER = "local:llm_ckpts/xxxx"
 # Ckpt folder format:
@@ -49,11 +54,11 @@ VALID_FOLDER = None  # "/path/to/dataset"
 data = dict(
     seq_len=SEQ_LEN,
     # micro_num means the number of micro_batch contained in one gradient update
-    micro_num=4,
+    micro_num=1,
     # packed_length = micro_bsz * SEQ_LEN
-    micro_bsz=2,
+    micro_bsz=1,
     # defaults to the value of micro_num
-    valid_micro_num=4,
+    valid_micro_num=1,
     # defaults to 0, means disable evaluate
     valid_every=50,
     pack_sample_into_one=False,
@@ -131,7 +136,7 @@ beta2_scheduler = dict(
 
 use_fp32_norm = False
 model = dict(
-    checkpoint=False,  # The proportion of layers for activation aheckpointing, the optional value are True/False/[0-1]
+    checkpoint=True,  # The proportion of layers for activation aheckpointing, the optional value are True/False/[0-1]
     num_attention_heads=NUM_ATTENTION_HEAD,
     embed_split_hidden=True,
     vocab_size=VOCAB_SIZE,
@@ -174,9 +179,9 @@ weight parallel (dict):
 """
 parallel = dict(
     zero1=dict(size=-1),
-    tensor=dict(size=2, mode="isp"),
+    tensor=dict(size=8, mode="isp"),
     pipeline=dict(size=1, interleaved_overlap=True),
-    weight=dict(size=4, overlap=True, memory_pool=True),
+    weight=dict(size=1, overlap=True, memory_pool=True),
 )
 
 cudnn_deterministic = False
